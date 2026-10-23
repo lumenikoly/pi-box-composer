@@ -1,0 +1,10 @@
+/target/
+/.local/
+*.log
+/release/
+/release-assets/
+/release-notes.md
+*.pdb
+.DS_Store
+Thumbs.db
+Desktop.ini

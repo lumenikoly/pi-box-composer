@@ -1,0 +1,27 @@
+[package]
+name = "pi-box-composer"
+version = "0.0.5"
+edition = "2024"
+rust-version = "1.88"
+description = "A Windows launcher for Pi environments in Podman or Docker Desktop"
+license = "MIT"
+
+[features]
+capture-ui = ["dep:image"]
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+rfd = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3.23"
+zeroize = "1.8"
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true

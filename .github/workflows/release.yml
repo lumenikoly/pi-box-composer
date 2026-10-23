@@ -1,0 +1,126 @@
+name: Release executable
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix
+        required: true
+        default: '0.0.5'
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate main, version and release notes
+        id: version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || { echo "Run releases from main." >&2; exit 1; }
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+          version = os.environ["VERSION"]
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+              raise SystemExit("Version must match X.Y.Z without a v prefix.")
+          package = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]
+          lock = tomllib.loads(pathlib.Path("Cargo.lock").read_text(encoding="utf-8"))
+          if package["name"] != "pi-box-composer" or package["version"] != version:
+              raise SystemExit("Cargo.toml name/version does not match the release.")
+          entries = [p for p in lock["package"] if p["name"] == package["name"]]
+          if len(entries) != 1 or entries[0]["version"] != version:
+              raise SystemExit("Cargo.lock version does not match the release.")
+          heading = f"# {version}"
+          lines = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          if lines.count(heading) != 1:
+              raise SystemExit("CHANGELOG.md must have exactly one release section.")
+          notes = []
+          for line in lines[lines.index(heading) + 1:]:
+              if line.startswith("# "):
+                  break
+              notes.append(line)
+          if not "\n".join(notes).strip():
+              raise SystemExit("Release notes must not be empty.")
+          PY
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            echo "Tag v$VERSION already exists." >&2
+            exit 1
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows x64 executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Collect executable
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = 'target/x86_64-pc-windows-msvc/release/pi-box-composer.exe'
+          if (-not (Test-Path -LiteralPath $binary)) { throw 'Release executable is missing.' }
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Copy-Item -LiteralPath $binary -Destination "release-assets/pi-box-composer_${env:VERSION}_windows_x64.exe"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-windows-x64
+          path: release-assets/*.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-windows-x64
+          path: release-assets
+      - name: Create checksums
+        working-directory: release-assets
+        run: sha256sum *.exe > SHA256SUMS
+      - name: Extract release notes
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          awk -v header="# $VERSION" '$0 == header { found=1; next } found && /^# / { exit } found { print }' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Publish GitHub Release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --title "pi-box-composer $TAG" --notes-file release-notes.md --fail-on-no-commits
