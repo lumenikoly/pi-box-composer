@@ -21,7 +21,10 @@ pub const STEPS: [(&str, &str); 7] = [
     ("Файлы окружения", "Containerfile и конфигурация Caddy"),
     ("Сборка образа", "Pi 1.3.0 и расширение разрешений"),
     ("Сети контейнеров", "Внутренняя сеть Pi и сеть прокси"),
-    ("Запуск прокси", "Токен и Caddy для llama.cpp"),
+    (
+        "Запуск прокси",
+        "Сборка Caddy без file capabilities, токен и запуск",
+    ),
     (
         "Проверка модели",
         "Список моделей и проверка прямого соединения",
@@ -41,6 +44,14 @@ fn cmd(args: &[&str]) -> Cmd {
     Cmd::new(args.iter().copied())
 }
 fn build(settings: &Settings) -> Cmd {
+    build_image(settings, IMAGE, "image")
+}
+
+fn build_proxy(settings: &Settings) -> Cmd {
+    build_image(settings, CADDY, "proxy/image")
+}
+
+fn build_image(settings: &Settings, image: &str, directory: &str) -> Cmd {
     let mut args = vec!["build".to_owned()];
     match settings.engine {
         Engine::Podman => args.push("--pull=missing".into()),
@@ -50,14 +61,15 @@ fn build(settings: &Settings) -> Cmd {
     }
     args.extend([
         "-t".into(),
-        IMAGE.into(),
+        image.into(),
         "-f".into(),
         settings
             .env_root()
-            .join("image/Containerfile")
+            .join(directory)
+            .join("Containerfile")
             .display()
             .to_string(),
-        settings.env_root().join("image").display().to_string(),
+        settings.env_root().join(directory).display().to_string(),
     ]);
     let mut command = Cmd::new(args);
     command.timeout = Duration::from_secs(30 * 60);
@@ -125,6 +137,7 @@ fn proxy_run(settings: &Settings) -> Cmd {
         "-d",
         "--name",
         &n.proxy,
+        "--pull=never",
         "--label",
         &format!("pi-launcher.owner={}", n.owner),
         "--network",
@@ -217,6 +230,7 @@ pub fn step_instructions(step: usize, s: &Settings) -> Vec<crate::instructions::
         1 => vec![
             I::file("Образ Pi", "Launcher создаёт этот файл автоматически. Он описывает Node.js, Pi и расширение разрешений. Кнопка копирует содержимое файла, а не команду PowerShell.", s.env_root().join("image/Containerfile").display().to_string(), CONTAINERFILE.into()),
             I::file("Настройки прокси", "Разрешает только запросы списка моделей и чата к выбранному llama.cpp. Токен читается из окружения прокси, его значения в файле нет.", s.env_root().join("proxy/Caddyfile").display().to_string(), s.caddyfile()),
+            I::file("Образ прокси", "Отдельный образ Caddy: удаляет file capability, несовместимую с --cap-drop=all. Образ Pi/Node не меняется.", s.env_root().join("proxy/image/Containerfile").display().to_string(), PROXY_CONTAINERFILE.into()),
         ],
         2 => vec![command("Сборка образа Pi", "Выполняйте после создания Containerfile. Первый запуск скачивает базовый образ и npm-пакеты. Дождитесь успешного завершения сборки.", build(s))],
         3 => vec![
@@ -224,7 +238,10 @@ pub fn step_instructions(step: usize, s: &Settings) -> Vec<crate::instructions::
             command("Внешняя сеть прокси", "Эта сеть позволяет Caddy обращаться к серверу модели. Сам агент Pi к ней не подключается.", network_create(&n.uplink, false, &format!("pi-launcher.owner={}", n.owner))).when("Только если сеть ещё не создана"),
         ],
         4 => {
-            let mut items = vec![];
+            let mut items = vec![
+                I::file("Образ прокси", "Launcher записывает этот файл перед сборкой, в том числе при повторе шага 5 в существующем окружении.", s.env_root().join("proxy/image/Containerfile").display().to_string(), PROXY_CONTAINERFILE.into()),
+                command("Сборка образа Caddy", "Выполните до удаления старого прокси. Удаляет file capability бинарника; ограничения пользователя, файловой системы и capabilities контейнера сохраняются.", build_proxy(s)),
+            ];
             if s.engine == Engine::Docker {
                 items.push(I::command("Токен для ручного запуска", "Введите токен локальной модели в PowerShell. Следующая команда запуска прокси передаст эту переменную контейнеру. При запуске из UI launcher делает это сам.", "$env:LLAMA_API_KEY = Read-Host 'Токен llama.cpp'").when("Только при ручном выполнении команд"));
             } else {
@@ -321,7 +338,7 @@ pub fn validate_engine_info(engine: Engine, raw: &str) -> Result<()> {
 }
 
 fn prepare(s: &Settings) -> Result<()> {
-    for part in ["image", "proxy", "config", "state/projects"] {
+    for part in ["image", "proxy/image", "config", "state/projects"] {
         fs::create_dir_all(s.env_root().join(part))?;
     }
     // Any change to the generated files invalidates a previous ready marker.
@@ -329,6 +346,10 @@ fn prepare(s: &Settings) -> Result<()> {
     atomic_write(
         &s.env_root().join("image/Containerfile"),
         CONTAINERFILE.as_bytes(),
+    )?;
+    atomic_write(
+        &s.env_root().join("proxy/image/Containerfile"),
+        PROXY_CONTAINERFILE.as_bytes(),
     )?;
     atomic_write(
         &s.env_root().join("proxy/Caddyfile"),
@@ -445,6 +466,13 @@ fn start_proxy(s: &Settings, token: &str, runner: &Runner) -> Result<()> {
     if has_proxy {
         verify_proxy_owner(&n, runner)?;
     }
+    // Repeating step 5 also upgrades environments created by older launchers.
+    // Build first so a build failure leaves the existing proxy and token intact.
+    atomic_write(
+        &s.env_root().join("proxy/image/Containerfile"),
+        PROXY_CONTAINERFILE.as_bytes(),
+    )?;
+    runner.checked(&build_proxy(s))?;
     let docker_token = if s.engine == Engine::Docker {
         let value = if !token.is_empty() {
             token.to_owned()
@@ -824,6 +852,13 @@ mod tests {
             ..Settings::default()
         };
         let args = proxy_run(&s).args;
+        assert_eq!(args.last().unwrap(), CADDY);
+        assert!(args.iter().any(|arg| arg == "--pull=never"));
+        assert!(args.iter().any(|arg| arg == "--cap-drop=all"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--security-opt=no-new-privileges")
+        );
         assert!(args.windows(2).any(|a| a == ["--env", "LLAMA_API_KEY"]));
         assert!(
             !args
@@ -1032,6 +1067,19 @@ mod tests {
                 ..Settings::default()
             };
             assert!(build(&settings).allow_truncated_output);
+            let proxy_build = build_proxy(&settings);
+            assert!(proxy_build.allow_truncated_output);
+            assert!(
+                proxy_build
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["-t", CADDY])
+            );
+            assert_eq!(
+                Path::new(proxy_build.args.last().unwrap()),
+                settings.env_root().join("proxy/image")
+            );
+            assert!(PROXY_CONTAINERFILE.contains("RUN setcap -r /usr/bin/caddy"));
             for direct in [false, true] {
                 let command = probe(&settings, direct);
                 assert!(!command.allow_truncated_output);

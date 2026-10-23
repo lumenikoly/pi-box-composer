@@ -1,0 +1,2 @@
+FROM docker.io/library/caddy:2-alpine
+RUN setcap -r /usr/bin/caddy

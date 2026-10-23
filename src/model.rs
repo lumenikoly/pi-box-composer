@@ -8,9 +8,10 @@ use std::{
 };
 
 pub const IMAGE: &str = "localhost/pi-launcher-agent:1.3.0";
-pub const CADDY: &str = "docker.io/library/caddy:2-alpine";
+pub const CADDY: &str = "localhost/pi-box-composer-proxy:2-alpine-nocap";
 pub const GATEWAY: &str = "http://llama-gateway:8080";
 pub const CONTAINERFILE: &str = include_str!("../assets/Containerfile");
+pub const PROXY_CONTAINERFILE: &str = include_str!("../assets/ProxyContainerfile");
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Engine {

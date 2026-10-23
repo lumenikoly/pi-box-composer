@@ -41,10 +41,10 @@ cargo build --release --locked
 | Шаг | Действие |
 | --- | --- |
 | 1 | Podman: проверка rootless. Docker: проверка Docker Desktop и Linux containers |
-| 2 | Создание каталогов и запись `image/Containerfile`, `proxy/Caddyfile` |
+| 2 | Создание каталогов и запись `image/Containerfile`, `proxy/image/Containerfile`, `proxy/Caddyfile` |
 | 3 | Сборка `localhost/pi-launcher-agent:1.3.0` |
 | 4 | Создание и проверка внутренней сети Pi и внешней сети прокси |
-| 5 | Передача токена прокси и запуск/пересоздание Caddy |
+| 5 | Сборка отдельного Caddy без file capability, передача токена и запуск/пересоздание прокси |
 | 6 | Запрос `/v1/models` через прокси и проверка недоступности прямого соединения с llama.cpp |
 | 7 | Запись модели, лимитов и политики разрешений |
 
@@ -67,6 +67,7 @@ cargo build --release --locked
 %LOCALAPPDATA%\PiLauncher\environment\
   image\Containerfile
   proxy\Caddyfile
+  proxy\image\Containerfile
   config\models.json
   config\settings.json
   config\permissions.json
@@ -100,6 +101,8 @@ cargo build --release --locked
 - LAN-соединение Caddy → llama.cpp сохранено как HTTP, как в исходном скрипте. HTTPS, скрытие файлов внутри проекта и отдельная копия/worktree не реализованы.
 
 Образы Node/Caddy используют теги; npm-версии Pi и расширения закреплены на версиях исходного скрипта. Это не полностью воспроизводимая сборка контейнера по digest. При несовместимости этих версий сборка завершится видимой ошибкой.
+
+Прокси использует локальный образ `localhost/pi-box-composer-proxy:2-alpine-nocap`, производный от `docker.io/library/caddy:2-alpine`. Его отдельный Containerfile удаляет file capability с `/usr/bin/caddy` командой `setcap -r`; UID 1000, read-only, `--cap-drop=all` и `no-new-privileges` сохраняются. Это устраняет конфликт, вызывающий `exec /usr/bin/caddy: operation not permitted`. Для существующего окружения повторите шаг 5: launcher запишет рецепт и соберёт образ перед пересозданием прокси. При ошибке сборки старый прокси не удаляется. Затем повторите шаги 6 и 7. Файл `image/Containerfile` для Pi/Node менять не требуется.
 
 ## Разработка и проверка
 
