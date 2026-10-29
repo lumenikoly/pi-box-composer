@@ -43,12 +43,6 @@ pub enum Access {
 }
 
 impl Access {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "Только чтение",
-            Self::ReadWrite => "Чтение и запись",
-        }
-    }
     pub fn mount_mode(self) -> &'static str {
         match self {
             Self::ReadOnly => "ro",
@@ -65,12 +59,121 @@ pub enum Session {
     Resume,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum CommandAccess {
+    Disabled,
+    #[default]
+    Ask,
+    Allow,
+}
+
+impl CommandAccess {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Запретить",
+            Self::Ask => "Спрашивать",
+            Self::Allow => "Разрешить",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProjectPermissions {
+    pub write: Option<CommandAccess>,
+    pub commands: Option<CommandAccess>,
+    pub rules: Vec<PermissionRule>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum RuleTarget {
+    #[default]
+    Read,
+    Write,
+    Command,
+}
+
+impl RuleTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Read => "Чтение",
+            Self::Write => "Запись",
+            Self::Command => "Команда",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PermissionRule {
+    pub target: RuleTarget,
+    pub pattern: String,
+    pub action: CommandAccess,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Plugin {
+    pub path: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PiOptions {
+    pub rules: Vec<PermissionRule>,
+    pub default_access: Access,
+    pub default_session: Session,
+    pub commands: CommandAccess,
+    pub confirm_edits: bool,
+    pub light_theme: bool,
+    pub auto_compact: bool,
+    pub skills: bool,
+    pub plugins: Vec<Plugin>,
+}
+
+impl Default for PiOptions {
+    fn default() -> Self {
+        Self {
+            rules: vec![],
+            default_access: Access::ReadOnly,
+            default_session: Session::New,
+            commands: CommandAccess::Ask,
+            confirm_edits: true,
+            light_theme: false,
+            auto_compact: true,
+            skills: false,
+            plugins: vec![],
+        }
+    }
+}
+
+impl PiOptions {
+    pub fn write_access(&self) -> CommandAccess {
+        if self.default_access == Access::ReadOnly {
+            CommandAccess::Disabled
+        } else if self.confirm_edits {
+            CommandAccess::Ask
+        } else {
+            CommandAccess::Allow
+        }
+    }
+
+    pub fn set_write_access(&mut self, value: CommandAccess) {
+        self.default_access = if value == CommandAccess::Disabled {
+            Access::ReadOnly
+        } else {
+            Access::ReadWrite
+        };
+        self.confirm_edits = value != CommandAccess::Allow;
+    }
+}
+
 impl Session {
     pub fn label(self) -> &'static str {
         match self {
             Self::New => "Новая",
             Self::Continue => "Продолжить",
-            Self::Resume => "Выбрать прошлую",
+            Self::Resume => "Выбрать сессию",
         }
     }
     pub fn flag(self) -> Option<&'static str> {
@@ -198,18 +301,28 @@ pub struct Names {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Recent {
+    #[serde(default)]
+    pub permissions: Option<ProjectPermissions>,
     pub path: String,
     pub access: Access,
+    #[serde(default)]
+    pub session: Session,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Saved {
+    // Missing in older configs: enable the Explorer menu on the next normal launch.
+    pub explorer_menu: Option<bool>,
+    pub permissions: Option<ProjectPermissions>,
     pub settings: Settings,
     pub recent: Vec<Recent>,
     pub project: String,
     pub access: Access,
     pub session: Session,
+    pub pi: PiOptions,
 }
 
 impl Saved {
@@ -227,17 +340,92 @@ impl Saved {
     }
     pub fn remember(&mut self, project: &Path) {
         let path = project.to_string_lossy().into_owned();
+        let pinned = self
+            .recent
+            .iter()
+            .any(|p| p.pinned && normalized_path(Path::new(&p.path)) == normalized_path(project));
         self.recent
             .retain(|p| normalized_path(Path::new(&p.path)) != normalized_path(project));
         self.recent.insert(
             0,
             Recent {
+                permissions: self.permissions.clone(),
                 path: path.clone(),
                 access: self.access,
+                session: self.session,
+                pinned,
             },
         );
-        self.recent.truncate(10);
+        self.recent.sort_by_key(|p| !p.pinned);
+        let mut unpinned = 0;
+        self.recent.retain(|project| {
+            if project.pinned {
+                true
+            } else {
+                unpinned += 1;
+                unpinned <= 10
+            }
+        });
         self.project = path;
+    }
+
+    pub fn select_project(&mut self, path: &str) {
+        let path = path.trim().trim_matches('"').to_owned();
+        if normalized_path(Path::new(&self.project)) == normalized_path(Path::new(&path)) {
+            self.project = path;
+            return;
+        }
+        let recent = self
+            .recent
+            .iter()
+            .find(|p| normalized_path(Path::new(&p.path)) == normalized_path(Path::new(&path)));
+        self.permissions = recent.map_or(Some(ProjectPermissions::default()), |p| {
+            p.permissions.clone()
+        });
+        self.access = recent.map_or(self.pi.default_access, |p| p.access);
+        self.session = recent.map_or(self.pi.default_session, |p| p.session);
+        self.project = path;
+    }
+
+    pub fn effective_permissions(&self) -> (Access, PiOptions) {
+        let mut options = self.pi.clone();
+        let mut access = self.access;
+        if let Some(permissions) = &self.permissions {
+            let write = permissions.write.unwrap_or_else(|| self.pi.write_access());
+            access = if write == CommandAccess::Disabled {
+                Access::ReadOnly
+            } else {
+                Access::ReadWrite
+            };
+            options.confirm_edits = write == CommandAccess::Ask;
+            options.commands = permissions.commands.unwrap_or(options.commands);
+            options.rules.extend(permissions.rules.clone());
+        }
+        (access, options)
+    }
+
+    pub fn editable_permissions(&mut self) -> &mut ProjectPermissions {
+        self.permissions.get_or_insert_with(|| ProjectPermissions {
+            write: Some(if self.access == Access::ReadOnly {
+                CommandAccess::Disabled
+            } else if self.pi.confirm_edits {
+                CommandAccess::Ask
+            } else {
+                CommandAccess::Allow
+            }),
+            commands: None,
+            rules: vec![],
+        })
+    }
+
+    pub fn remember_project_preferences(&mut self) {
+        if let Some(recent) = self.recent.iter_mut().find(|p| {
+            normalized_path(Path::new(&p.path)) == normalized_path(Path::new(&self.project))
+        }) {
+            recent.access = self.access;
+            recent.permissions = self.permissions.clone();
+            recent.session = self.session;
+        }
     }
 }
 
@@ -371,6 +559,52 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_projects_migrate_and_new_folders_do_not_inherit_write_access() {
+        let mut saved: Saved = serde_json::from_str(r#"{"project":"C:\\code\\one","access":"ReadWrite","recent":[{"path":"C:\\code\\one","access":"ReadWrite"}]}"#).unwrap();
+        assert_eq!(saved.pi, PiOptions::default());
+        assert!(!saved.recent[0].pinned);
+        assert_eq!(saved.recent[0].session, Session::New);
+        saved.select_project(r#" "C:\code\two" "#);
+        assert_eq!(saved.project, r"C:\code\two");
+        assert_eq!(saved.access, Access::ReadOnly);
+        saved.select_project(r"c:\CODE\one");
+        assert_eq!(saved.access, Access::ReadWrite);
+        assert_eq!(saved.effective_permissions().0, Access::ReadWrite);
+        assert_eq!(saved.editable_permissions().write, Some(CommandAccess::Ask));
+    }
+
+    #[test]
+    fn project_preferences_and_pins_survive_switches_and_serialization() {
+        let mut saved = Saved::default();
+        saved.select_project(r"C:\code\one");
+        saved.access = Access::ReadWrite;
+        saved.editable_permissions().write = Some(CommandAccess::Allow);
+        saved.editable_permissions().commands = Some(CommandAccess::Disabled);
+        saved.session = Session::Continue;
+        saved.remember(Path::new(r"C:\code\one"));
+        saved.recent[0].pinned = true;
+        saved.select_project(r"C:\code\two");
+        saved.pi.set_write_access(CommandAccess::Ask);
+        assert_eq!(saved.effective_permissions().0, Access::ReadWrite);
+        assert!(saved.effective_permissions().1.confirm_edits);
+        saved.remember(Path::new(r"C:\code\two"));
+        saved.select_project(r"C:\code\one");
+        assert_eq!(saved.access, Access::ReadWrite);
+        assert_eq!(saved.session, Session::Continue);
+        saved.session = Session::Resume;
+        saved.remember_project_preferences();
+        saved.remember(Path::new(r"C:\code\one"));
+        let restored: Saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(restored.recent[0].pinned);
+        assert_eq!(restored.recent[0].session, Session::Resume);
+        assert_eq!(restored.recent.len(), 2);
+        let (access, options) = restored.effective_permissions();
+        assert_eq!(access, Access::ReadWrite);
+        assert!(!options.confirm_edits);
+        assert_eq!(options.commands, CommandAccess::Disabled);
+    }
 
     #[test]
     fn legacy_settings_default_to_podman_and_keep_existing_paths() {

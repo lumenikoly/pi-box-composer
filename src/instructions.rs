@@ -82,7 +82,7 @@ pub fn preparation(engine: Engine, section: usize) -> Vec<Instruction> {
             Instruction::note("Выберите rootless-режим", "pi-box-composer требует rootless Podman. Если проверка сообщает rootful, выполните команды ниже по порядку. Они изменяют режим существующей Machine; работающие в ней контейнеры будут остановлены."),
             Instruction::command("1. Остановите Machine", "Освобождает VM для изменения режима. Если Machine уже остановлена, переходите к следующей команде.", "podman machine stop").when("Если Machine запущена"),
             Instruction::command("2. Переключите режим", "Отключает rootful-режим для выбранной по умолчанию Machine.", "podman machine set --rootful=false"),
-            Instruction::command("3. Запустите Machine", "Запускает VM после изменения режима. Затем вернитесь в мастер и нажмите «Проверить и продолжить».", "podman machine start"),
+            Instruction::command("3. Запустите Machine", "Запускает VM после изменения режима. Затем откройте «Настройки → Модель» и нажмите «Подключить».", "podman machine start"),
         ],
         (Engine::Podman, 3) => vec![
             Instruction::command("Запустите Machine", "Выполняйте после создания Machine или если она была остановлена.", "podman machine start").when("Если Machine остановлена"),
@@ -99,7 +99,7 @@ pub fn preparation(engine: Engine, section: usize) -> Vec<Instruction> {
         ],
         (Engine::Docker, 2) => vec![
             Instruction::command("Запустите Docker Desktop", "Ожидает запуска приложения до 60 секунд. Если команда desktop недоступна, откройте Docker Desktop через меню «Пуск».", "docker desktop start --timeout 60").when("Если Docker Desktop ещё не запущен"),
-            Instruction::command("Проверьте движок", "Команда должна показать сведения о сервере без ошибки подключения. Затем нажмите «Проверить и продолжить» в pi-box-composer.", "docker info"),
+            Instruction::command("Проверьте движок", "Команда должна показать сведения о сервере без ошибки подключения. Затем нажмите «Подключить» в pi-box-composer.", "docker info"),
         ],
         (Engine::Docker, 3) => vec![
             Instruction::command("Посмотрите подключения", "Звёздочкой отмечен текущий context. Для pi-box-composer нужно подключение к локальному Docker Desktop с Linux containers.", "docker context ls"),

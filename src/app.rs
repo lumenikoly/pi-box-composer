@@ -16,13 +16,15 @@ use std::{
     time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
+#[path = "app_ui.rs"]
+mod ui;
 
-const BG: Color32 = Color32::from_rgb(246, 247, 250);
-const TEXT: Color32 = Color32::from_rgb(32, 36, 49);
-const MUTED: Color32 = Color32::from_rgb(111, 117, 134);
-const ACCENT: Color32 = Color32::from_rgb(97, 76, 214);
-const TINT: Color32 = Color32::from_rgb(240, 237, 255);
-const BORDER: Color32 = Color32::from_rgb(226, 229, 237);
+const BG: Color32 = Color32::from_rgb(247, 248, 250);
+const TEXT: Color32 = Color32::from_rgb(29, 38, 43);
+const MUTED: Color32 = Color32::from_rgb(101, 114, 121);
+const ACCENT: Color32 = Color32::from_rgb(22, 112, 100);
+const TINT: Color32 = Color32::from_rgb(231, 244, 239);
+const BORDER: Color32 = Color32::from_rgb(224, 230, 230);
 const GREEN: Color32 = Color32::from_rgb(37, 132, 96);
 const RED: Color32 = Color32::from_rgb(180, 58, 67);
 
@@ -30,6 +32,7 @@ const RED: Color32 = Color32::from_rgb(180, 58, 67);
 enum Page {
     Project,
     Setup,
+    Preferences,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +96,10 @@ pub struct Launcher {
     want_close: bool,
     started: Instant,
     smoke_test: bool,
+    project_input: String,
+    search: String,
+    preferences_tab: usize,
+    pending_launch: bool,
     #[cfg(feature = "capture-ui")]
     capture_requested: bool,
 }
@@ -114,14 +121,21 @@ fn primary(ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
 }
 
 fn field(ui: &mut egui::Ui, value: &mut String, hint: &str, password: bool) -> egui::Response {
-    ui.add_sized(
+    let response = ui.add_sized(
         [ui.available_width(), 44.0],
         egui::TextEdit::singleline(value)
             .hint_text(hint)
             .password(password)
             .desired_width(f32::INFINITY)
             .margin(egui::vec2(12.0, 10.0)),
-    )
+    );
+    ui.painter().rect_stroke(
+        response.rect,
+        8,
+        Stroke::new(1.0_f32, if response.has_focus() { ACCENT } else { BORDER }),
+        egui::StrokeKind::Inside,
+    );
+    response
 }
 
 impl Launcher {
@@ -131,7 +145,25 @@ impl Launcher {
         saved: Saved,
         smoke_test: bool,
     ) -> Self {
-        let mut style = (*cc.egui_ctx.style()).clone();
+        let mut app = Self::with_context(&cc.egui_ctx, data_dir, saved, smoke_test);
+        if cfg!(windows) && !smoke_test && app.saved.explorer_menu.unwrap_or(true) {
+            // Refresh the executable path as well, e.g. after moving a portable install.
+            if let Err(error) = crate::explorer::configure(&app.data_dir, true) {
+                app.message = format!("Не удалось добавить команду в меню папок: {error:#}");
+                app.error = true;
+                app.log(app.message.clone());
+            }
+        }
+        app
+    }
+
+    fn with_context(
+        ctx: &egui::Context,
+        data_dir: PathBuf,
+        saved: Saved,
+        smoke_test: bool,
+    ) -> Self {
+        let mut style = (*ctx.style()).clone();
         style.animation_time = 0.0;
         style.visuals = egui::Visuals::light();
         style.visuals.panel_fill = BG;
@@ -144,6 +176,9 @@ impl Launcher {
         style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
         style.visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
         style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+        style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
         style.visuals.widgets.hovered.bg_fill = TINT;
         style.visuals.widgets.hovered.weak_bg_fill = TINT;
         style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
@@ -159,7 +194,7 @@ impl Launcher {
         ] {
             style.text_styles.insert(kind, FontId::proportional(size));
         }
-        cc.egui_ctx.set_style(style);
+        ctx.set_style(style);
         let mut fonts = egui::FontDefinitions::default();
         if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
             fonts
@@ -179,7 +214,7 @@ impl Launcher {
                     egui::FontFamily::Name("heading".into()),
                     vec!["segoe-semibold".into(), "segoe".into()],
                 );
-                cc.egui_ctx.style_mut(|style| {
+                ctx.style_mut(|style| {
                     style.text_styles.insert(
                         egui::TextStyle::Heading,
                         FontId::new(26.0, egui::FontFamily::Name("heading".into())),
@@ -187,8 +222,9 @@ impl Launcher {
                 });
             }
         }
-        cc.egui_ctx.set_fonts(fonts);
+        ctx.set_fonts(fonts);
         Self {
+            project_input: saved.project.clone(),
             saved,
             data_dir,
             page: Page::Project,
@@ -208,6 +244,9 @@ impl Launcher {
             want_close: false,
             started: Instant::now(),
             smoke_test,
+            search: String::new(),
+            preferences_tab: 0,
+            pending_launch: false,
             #[cfg(feature = "capture-ui")]
             capture_requested: false,
         }
@@ -257,7 +296,9 @@ impl Launcher {
                             match job {
                                 Some(Job::Step(0)) => {
                                     self.page = Page::Setup;
-                                    self.stage = 1;
+                                    self.stage = 0;
+                                    self.message =
+                                        "Движок доступен. Подключите сервер модели.".into();
                                 }
                                 Some(Job::Setup | Job::Step(5)) => {
                                     self.page = Page::Setup;
@@ -266,17 +307,30 @@ impl Launcher {
                                 Some(Job::Step(6)) => {
                                     self.page = Page::Project;
                                     self.message = "Настройки сохранены.".into();
+                                    if std::mem::take(&mut self.pending_launch)
+                                        && !self.want_close
+                                        && !self.cancel.load(Ordering::Relaxed)
+                                    {
+                                        next_job = Some(Job::Launch);
+                                    }
                                 }
-                                Some(Job::StartMachine) => next_job = Some(Job::Step(0)),
+                                Some(Job::StartMachine) => {
+                                    self.message =
+                                        "Движок запущен. Теперь можно подключить модель.".into();
+                                }
                                 _ => {}
                             }
                             if let Some(project) = project {
                                 self.saved.remember(&project);
+                                self.project_input = self.saved.project.clone();
                                 self.message = "Pi открыт в отдельном терминале.".into();
                                 self.persist();
                             }
                         }
                         Err(error) => {
+                            if job == Some(Job::Setup) {
+                                self.stage = 0;
+                            }
                             self.log(format!("ОШИБКА: {error}"));
                             self.message = error;
                             self.error = true;
@@ -323,7 +377,7 @@ impl Launcher {
         self.persist();
         let settings = self.saved.settings.clone();
         let project = self.saved.project.clone();
-        let access = self.saved.access;
+        let (access, options) = self.saved.effective_permissions();
         let session = self.saved.session;
         let data_dir = self.data_dir.clone();
         let token = Zeroizing::new(if matches!(job, Job::Setup | Job::Step(4)) {
@@ -376,7 +430,7 @@ impl Launcher {
                             Ok(None)
                         }
                         Job::Launch => environment::launch(
-                            &settings, &project, &data_dir, access, session, &runner,
+                            &settings, &project, &data_dir, access, session, &options, &runner,
                         )
                         .map(Some),
                         Job::StartMachine => {
@@ -405,33 +459,19 @@ impl Launcher {
         self.guide.open = true;
     }
 
+    pub fn open_preferences(&mut self) {
+        self.page = Page::Preferences;
+    }
+
+    pub fn open_project(&mut self, ctx: &egui::Context) {
+        self.request_launch(ctx);
+    }
+
     pub fn open_setup(&mut self) {
         self.page = Page::Setup;
         self.stage = 0;
         self.message.clear();
         self.error = false;
-    }
-
-    fn page_title(&mut self, ui: &mut egui::Ui, title: &str) {
-        ui.horizontal(|ui| {
-            ui.heading(title);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let more = ui.add(egui::Button::new("···").frame(false));
-                egui::Popup::menu(&more).show(|ui| {
-                    if crate::widgets::secondary(ui, "Диагностика", true).clicked() {
-                        self.show_diagnostics = true;
-                        ui.close();
-                    }
-                });
-                if self.page == Page::Project
-                    && ui
-                        .add_enabled(!self.busy(), egui::Button::new("Настройки").frame(false))
-                        .clicked()
-                {
-                    self.open_setup();
-                }
-            });
-        });
     }
 
     fn notice(&mut self, ui: &mut egui::Ui) {
@@ -457,365 +497,6 @@ impl Launcher {
                 }
             });
         ui.add_space(8.0);
-    }
-
-    fn project(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.page_title(ui, "Проект");
-        ui.add_space(18.0);
-        self.notice(ui);
-        let ready = environment::is_configured(&self.saved.settings);
-        let busy = self.busy();
-        let before = (
-            self.saved.project.clone(),
-            self.saved.access,
-            self.saved.session,
-        );
-        card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.label("Папка проекта");
-                if crate::widgets::folder(ui, &self.saved.project) {
-                    self.pick_project();
-                }
-                ui.add_space(16.0);
-                ui.label("Доступ к файлам");
-                let mut selected = usize::from(self.saved.access == Access::ReadWrite);
-                crate::widgets::segmented(
-                    ui,
-                    &mut selected,
-                    &[Access::ReadOnly.label(), Access::ReadWrite.label()],
-                );
-                self.saved.access = if selected == 0 {
-                    Access::ReadOnly
-                } else {
-                    Access::ReadWrite
-                };
-                if self.saved.access == Access::ReadWrite {
-                    secondary(ui, "Изменения сохраняются в выбранной папке.");
-                }
-                ui.add_space(16.0);
-                ui.label("Сессия");
-                let response = crate::widgets::select(ui, self.saved.session.label());
-                egui::Popup::menu(&response)
-                    .width(response.rect.width())
-                    .show(|ui| {
-                        for session in [Session::New, Session::Continue, Session::Resume] {
-                            if ui
-                                .selectable_value(&mut self.saved.session, session, session.label())
-                                .clicked()
-                            {
-                                ui.close();
-                            }
-                        }
-                    });
-            });
-            ui.add_space(24.0);
-            let title = if busy {
-                "Подготовка запуска…"
-            } else if !ready {
-                "Настроить окружение"
-            } else {
-                "Запустить Pi"
-            };
-            if primary(
-                ui,
-                title,
-                !busy && (!ready || !self.saved.project.is_empty()),
-            ) {
-                if ready {
-                    self.start(Job::Launch, ctx);
-                } else {
-                    self.open_setup();
-                }
-            }
-            if busy {
-                self.progress(ui);
-            }
-        });
-        if before
-            != (
-                self.saved.project.clone(),
-                self.saved.access,
-                self.saved.session,
-            )
-        {
-            self.dirty_at = Some(Instant::now());
-        }
-        if !self.saved.recent.is_empty() {
-            ui.add_space(24.0);
-            ui.label(RichText::new("Недавние проекты").color(MUTED));
-            let recent = self.saved.recent.clone();
-            ui.add_enabled_ui(!busy, |ui| {
-                for project in recent.iter().take(5) {
-                    if crate::widgets::select(ui, &project_name(&project.path))
-                        .on_hover_text(&project.path)
-                        .clicked()
-                    {
-                        self.saved.project = project.path.clone();
-                        self.saved.access = project.access;
-                        self.dirty_at = Some(Instant::now());
-                    }
-                }
-            });
-        }
-    }
-
-    fn pick_project(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .set_title("Папка проекта")
-            .pick_folder()
-        {
-            self.saved.project = path.display().to_string();
-            self.dirty_at = Some(Instant::now());
-        }
-    }
-
-    fn setup(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let busy = self.busy();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!busy, egui::Button::new("←  Назад").frame(false))
-                .clicked()
-            {
-                if self.stage == 0 {
-                    self.page = Page::Project;
-                } else {
-                    self.stage -= 1;
-                }
-                self.message.clear();
-                self.error = false;
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                for i in (0..3).rev() {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(32.0, 4.0), egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        rect,
-                        2,
-                        if i <= self.stage { ACCENT } else { BORDER },
-                    );
-                }
-            });
-        });
-        ui.add_space(20.0);
-        let title = match self.stage {
-            0 => "Окружение",
-            1 => "Сервер модели",
-            _ => "Модель",
-        };
-        self.page_title(ui, title);
-
-        ui.add_space(18.0);
-        self.notice(ui);
-        card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match self.stage {
-                0 => self.engine_form(ui, ctx),
-                1 if busy => {
-                    ui.add_space(12.0);
-                    ui.label("Подготовка окружения");
-
-                    ui.add_space(14.0);
-                    let completed = self.steps[..6]
-                        .iter()
-                        .filter(|s| **s == Status::Done)
-                        .count();
-                    ui.add(
-                        egui::ProgressBar::new(completed as f32 / 6.0)
-                            .fill(ACCENT)
-                            .corner_radius(4),
-                    );
-                    self.progress(ui);
-                }
-                1 => self.server_form(ui, ctx),
-                _ => {
-                    let response = crate::widgets::select(ui, &self.saved.settings.model);
-                    egui::Popup::menu(&response)
-                        .width(response.rect.width())
-                        .show(|ui| {
-                            for model in &self.models {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.saved.settings.model,
-                                        model.clone(),
-                                        model,
-                                    )
-                                    .clicked()
-                                {
-                                    self.dirty_at = Some(Instant::now());
-                                    ui.close();
-                                }
-                            }
-                        });
-                    ui.add_space(10.0);
-                    ui.collapsing("Лимиты модели", |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Контекст");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut self.saved.settings.context_window)
-                                        .range(1..=2_000_000)
-                                        .speed(1024),
-                                )
-                                .changed()
-                            {
-                                self.dirty_at = Some(Instant::now());
-                            }
-                            ui.label("Ответ");
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut self.saved.settings.max_tokens)
-                                        .range(1..=2_000_000)
-                                        .speed(256),
-                                )
-                                .changed()
-                            {
-                                self.dirty_at = Some(Instant::now());
-                            }
-                        });
-                    });
-                    ui.add_space(16.0);
-                    if primary(
-                        ui,
-                        if busy {
-                            "Сохраняем…"
-                        } else {
-                            "Сохранить"
-                        },
-                        !busy && !self.models.is_empty(),
-                    ) {
-                        self.start(Job::Step(6), ctx);
-                    }
-                }
-            }
-        });
-        ui.add_space(16.0);
-        if crate::widgets::secondary_full(ui, "Инструкция и команды", true).clicked()
-        {
-            self.guide.open = true;
-            self.guide.tab = usize::from(self.stage != 0);
-        }
-    }
-
-    fn engine_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let busy = self.busy();
-        let before = self.saved.settings.engine;
-        ui.add_enabled_ui(!busy, |ui| {
-            let mut selected = usize::from(before == Engine::Docker);
-            crate::widgets::segmented(ui, &mut selected, &["Podman", "Docker Desktop"]);
-            self.saved.settings.engine = if selected == 0 {
-                Engine::Podman
-            } else {
-                Engine::Docker
-            };
-        });
-        if self.saved.settings.engine != before {
-            self.saved.settings = environment::load_engine_profile(&self.saved.settings);
-            self.steps.fill(Status::Pending);
-            self.models.clear();
-            self.token.zeroize();
-            self.message.clear();
-            self.error = false;
-            self.dirty_at = Some(Instant::now());
-        }
-        let docker = self.saved.settings.engine == Engine::Docker;
-        ui.add_space(12.0);
-        secondary(
-            ui,
-            if docker {
-                "Docker Desktop · Linux containers"
-            } else {
-                "Podman · rootless Machine"
-            },
-        );
-        ui.add_space(20.0);
-        if primary(
-            ui,
-            if busy {
-                "Проверка…"
-            } else {
-                "Проверить и продолжить"
-            },
-            !busy,
-        ) {
-            self.start(Job::Step(0), ctx);
-        }
-        if busy {
-            self.progress(ui);
-        }
-        ui.add_space(10.0);
-        if crate::widgets::secondary_full(
-            ui,
-            if docker {
-                "Запустить Docker Desktop"
-            } else {
-                "Запустить Podman Machine"
-            },
-            !busy,
-        )
-        .clicked()
-        {
-            self.start(Job::StartMachine, ctx);
-        }
-    }
-
-    fn server_form(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let before = self.saved.settings.clone();
-        ui.horizontal(|ui| {
-            let width = (ui.available_width() - 104.0).max(180.0);
-            ui.vertical(|ui| {
-                ui.set_width(width);
-                ui.label("Адрес сервера");
-                field(ui, &mut self.saved.settings.host, "192.168.1.195", false);
-            });
-            ui.vertical(|ui| {
-                ui.set_width(96.0);
-                ui.label("Порт");
-                ui.add_sized(
-                    [96.0, 44.0],
-                    egui::DragValue::new(&mut self.saved.settings.port)
-                        .range(1..=65535)
-                        .speed(1),
-                );
-            });
-        });
-        ui.add_space(10.0);
-        ui.label(RichText::new("API-токен").strong());
-        field(ui, &mut self.token, "Введите токен llama.cpp", true);
-        secondary(
-            ui,
-            if self.saved.settings.engine == Engine::Docker {
-                "Пусто — использовать токен существующего прокси."
-            } else {
-                "Пусто — использовать секрет Podman."
-            },
-        );
-        ui.add_space(10.0);
-        ui.collapsing("Дополнительно", |ui| {
-            ui.label("Где хранить окружение");
-            field(
-                ui,
-                &mut self.saved.settings.root,
-                "Каталог окружения",
-                false,
-            );
-            if crate::widgets::secondary(ui, "Выбрать каталог…", true).clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_title("Каталог окружения")
-                    .pick_folder()
-            {
-                self.saved.settings.root = path.display().to_string();
-            }
-        });
-        if self.saved.settings != before {
-            self.steps[1..].fill(Status::Pending);
-            self.models.clear();
-            self.dirty_at = Some(Instant::now());
-        }
-        ui.add_space(18.0);
-        if primary(ui, "Подключить", true) {
-            self.start(Job::Setup, ctx);
-        }
     }
 
     fn progress(&mut self, ui: &mut egui::Ui) {
@@ -863,7 +544,8 @@ impl Launcher {
                 ui.label("В контейнер передаются выбранная папка и отдельное состояние Pi. Файлы .env внутри проекта доступны контейнеру: используйте рабочую копию без секретов.");
                 ui.label("Режим чтения запрещает запись в проект, но оставляет рабочие /tmp и /state. Проверка сети относится только к указанному серверу llama.cpp.");
                 if !self.saved.project.is_empty() {
-                    let args = environment::run_args(&self.saved.settings, Path::new(&self.saved.project), self.saved.access, self.saved.session);
+                    let (access, options) = self.saved.effective_permissions();
+                    let args = environment::run_args(&self.saved.settings, Path::new(&self.saved.project), access, self.saved.session, &options);
                     if crate::widgets::secondary(ui, "Копировать команду запуска", true).clicked() { ctx.copy_text(Cmd::new(args).preview(self.saved.settings.engine)); }
                 }
             });
@@ -902,6 +584,35 @@ fn perform_step(
     }
 }
 
+impl Launcher {
+    fn workspace_ui(&mut self, ctx: &egui::Context) {
+        self.sidebar(ctx);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG).inner_margin(24.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("main", self.page as u8, self.preferences_tab))
+                    .show(ui, |ui| {
+                        let width = ui.available_width().min(720.0);
+                        let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(margin);
+                            ui.vertical(|ui| {
+                                ui.set_width(width);
+                                ui.add_space(10.0);
+                                match self.page {
+                                    Page::Project => self.project(ui, ctx),
+                                    Page::Setup => self.setup(ui, ctx),
+                                    Page::Preferences => self.preferences(ui),
+                                }
+                                ui.add_space(24.0);
+                            });
+                        });
+                    });
+            });
+    }
+}
+
 impl eframe::App for Launcher {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         #[cfg(feature = "capture-ui")]
@@ -919,24 +630,37 @@ impl eframe::App for Launcher {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().id_salt("main").show(ui, |ui| {
-                let width = ui.available_width().min(560.0);
-                let margin = ((ui.available_width() - width) / 2.0).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(margin);
-                    ui.vertical(|ui| {
-                        ui.set_width(width);
-                        ui.add_space(32.0);
-                        match self.page {
-                            Page::Project => self.project(ui, ctx),
-                            Page::Setup => self.setup(ui, ctx),
-                        }
-                        ui.add_space(24.0);
-                    });
-                });
-            });
-        });
+        if !self.busy() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
+                self.pick_project();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Comma)) {
+                self.open_preferences();
+                self.preferences_tab = 0;
+                self.pending_launch = false;
+            }
+            if self.page == Page::Project
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter))
+            {
+                self.request_launch(ctx);
+            }
+            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+            if let Some(path) = dropped.first().and_then(|f| f.path.as_ref()) {
+                if path.is_dir() {
+                    self.saved.remember_project_preferences();
+                    self.saved.select_project(&path.display().to_string());
+                    self.project_input = self.saved.project.clone();
+                    self.page = Page::Project;
+                    self.pending_launch = false;
+                    self.message.clear();
+                    self.dirty_at = Some(Instant::now());
+                } else {
+                    self.message = "Перетащите папку проекта, а не отдельный файл.".into();
+                    self.error = true;
+                }
+            }
+        }
+        self.workspace_ui(ctx);
         if self.show_diagnostics {
             self.diagnostics(ctx);
         }
@@ -1009,6 +733,147 @@ impl Launcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview_app(ctx: &egui::Context, data: &Path) -> Launcher {
+        let project = data.join("example-project").display().to_string();
+        let saved = Saved {
+            project: project.clone(),
+            recent: vec![Recent {
+                permissions: None,
+                path: project,
+                access: Access::ReadOnly,
+                session: Session::New,
+                pinned: true,
+            }],
+            settings: Settings {
+                root: data.join("environment").display().to_string(),
+                model: "qwen3-coder".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_json(
+            &saved.settings.env_root().join("config/ready.json"),
+            &saved.settings,
+        )
+        .unwrap();
+        Launcher::with_context(ctx, data.to_path_buf(), saved, false)
+    }
+
+    fn render(
+        app: &mut Launcher,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.workspace_ui(ctx),
+        )
+    }
+
+    fn text_bounds(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing visible label: {label}"))
+    }
+
+    #[test]
+    fn compact_workspace_keeps_launch_visible_and_navigation_reachable() {
+        let data = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = preview_app(&ctx, data.path());
+        let size = egui::vec2(860.0, 660.0);
+        render(&mut app, &ctx, size, vec![]);
+        let output = render(&mut app, &ctx, size, vec![]);
+        let launch = text_bounds(&output, "Открыть pi");
+        assert!(launch.right() < size.x && launch.bottom() < size.y);
+        let settings = text_bounds(&output, "Настройки").center();
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                &ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(settings),
+                    egui::Event::PointerButton {
+                        pos: settings,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(app.page == Page::Preferences);
+        let output = render(&mut app, &ctx, size, vec![]);
+        let model = text_bounds(&output, "Модель").center();
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                &ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(model),
+                    egui::Event::PointerButton {
+                        pos: model,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(app.page == Page::Setup);
+        let output = render(&mut app, &ctx, size, vec![]);
+        let connect = text_bounds(&output, "Подключить");
+        assert!(connect.right() < size.x && connect.bottom() < size.y);
+    }
+
+    #[test]
+    fn setup_preserves_launch_intent_and_close_does_not_start_a_terminal() {
+        let data = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app =
+            Launcher::with_context(&ctx, data.path().join("launcher"), Saved::default(), false);
+        let project = data.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        app.saved.project = project.display().to_string();
+        app.project_input = app.saved.project.clone();
+        app.saved.access = Access::ReadWrite;
+        app.saved.session = Session::Continue;
+        app.request_launch(&ctx);
+        assert!(app.page == Page::Setup && app.pending_launch);
+        assert_eq!(app.saved.access, Access::ReadWrite);
+        assert_eq!(app.saved.session, Session::Continue);
+        let (tx, rx) = mpsc::sync_channel(4);
+        app.events = Some(rx);
+        app.active_job = Some(Job::Setup);
+        tx.send(Event::Models(vec!["test-model".into()])).unwrap();
+        tx.send(Event::Finished(Ok(None))).unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.stage, 2);
+        assert!(app.pending_launch);
+        let (tx, rx) = mpsc::sync_channel(4);
+        app.events = Some(rx);
+        app.active_job = Some(Job::Step(6));
+        app.want_close = true;
+        tx.send(Event::Finished(Ok(None))).unwrap();
+        app.poll(&ctx);
+        assert!(!app.busy());
+        assert!(app.active_job.is_none());
+    }
 
     #[test]
     fn flooded_logs_are_bounded_and_completion_is_reliable() {

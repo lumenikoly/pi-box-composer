@@ -278,6 +278,10 @@ pub fn execute_step(step: usize, s: &Settings, token: &str, runner: &Runner) -> 
         0 => check_engine(runner)?,
         1 => prepare(s)?,
         2 => {
+            atomic_write(
+                &s.env_root().join("image/Containerfile"),
+                CONTAINERFILE.as_bytes(),
+            )?;
             runner.checked(&build(s))?;
         }
         3 => {
@@ -629,15 +633,71 @@ pub fn validate_isolation_exit(code: i32) -> Result<()> {
     }
 }
 
-fn policy() -> Value {
+fn policy(options: &PiOptions, access: Access) -> Value {
     // serde_json's default map ordering is alphabetical; explicit preserve_order is
     // enabled in Cargo.toml because permission pattern precedence must be retained.
-    json!({"permission": {
-        "*": "ask", "read": "allow", "edit": "ask", "write": "ask",
-        "bash": {"*": "ask", "rm -rf *": "deny", "sudo *": "deny", "git push*": "deny"},
+    let edits = if access == Access::ReadOnly {
+        "deny"
+    } else if options.confirm_edits {
+        "ask"
+    } else {
+        "allow"
+    };
+    let commands = match options.commands {
+        CommandAccess::Disabled => "deny",
+        CommandAccess::Ask => "ask",
+        CommandAccess::Allow => "allow",
+    };
+    let mut result = json!({"permission": {
+        "*": "ask", "read": "allow", "grep": "allow", "find": "allow", "ls": "allow", "edit": edits, "write": edits,
+        "bash": {"*": commands, "rm -rf *": "deny", "sudo *": "deny", "git push*": "deny"},
         "path": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
         "external_directory": "deny", "mcp": "deny"
-    }, "yoloMode": false})
+    }, "yoloMode": false});
+    for rule in &options.rules {
+        let pattern = rule.pattern.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        let surfaces: &[&str] = match rule.target {
+            RuleTarget::Read => &["read", "grep", "find", "ls"],
+            RuleTarget::Write if access == Access::ReadWrite => &["edit", "write"],
+            RuleTarget::Command if options.commands != CommandAccess::Disabled => &["bash"],
+            _ => continue,
+        };
+        let action = match rule.action {
+            CommandAccess::Disabled => "deny",
+            CommandAccess::Ask => "ask",
+            CommandAccess::Allow => "allow",
+        };
+        for surface in surfaces {
+            let value = &mut result["permission"][*surface];
+            if !value.is_object() {
+                *value = json!({"*": value.clone()});
+            }
+            let map = value.as_object_mut().unwrap();
+            // Reinsert so a project override also wins in pattern order.
+            map.shift_remove(pattern);
+            map.insert(pattern.into(), json!(action));
+        }
+    }
+    // User rules cannot override the built-in command restrictions.
+    let bash = result["permission"]["bash"].as_object_mut().unwrap();
+    for pattern in ["rm -rf *", "sudo *", "git push*"] {
+        bash.shift_remove(pattern);
+        bash.insert(pattern.into(), json!("deny"));
+    }
+    result
+}
+
+fn pi_settings(s: &Settings, options: &PiOptions) -> Value {
+    json!({
+        "defaultProvider": "llama-lan", "defaultModel": s.model, "defaultThinkingLevel": "off",
+        "defaultProjectTrust": "never", "enableInstallTelemetry": false, "enableAnalytics": false,
+        "theme": if options.light_theme { "light" } else { "dark" },
+        "compaction": {"enabled": options.auto_compact},
+        "defaultTools": ["read", "grep", "find", "ls"]
+    })
 }
 
 fn save_config(s: &Settings) -> Result<()> {
@@ -657,13 +717,12 @@ fn save_config(s: &Settings) -> Result<()> {
     )?;
     write_json(
         &config.join("settings.json"),
-        &json!({
-            "defaultProvider": "llama-lan", "defaultModel": s.model, "defaultThinkingLevel": "off",
-            "defaultProjectTrust": "never", "enableInstallTelemetry": false, "enableAnalytics": false,
-            "defaultTools": ["read", "bash", "edit", "write"]
-        }),
+        &pi_settings(s, &PiOptions::default()),
     )?;
-    write_json(&config.join("permissions.json"), &policy())?;
+    write_json(
+        &config.join("permissions.json"),
+        &policy(&PiOptions::default(), Access::ReadOnly),
+    )?;
     write_json(&config.join("ready.json"), s)?;
     Ok(())
 }
@@ -683,7 +742,13 @@ pub fn load_engine_profile(settings: &Settings) -> Settings {
         .unwrap_or_else(|| settings.clone())
 }
 
-pub fn run_args(s: &Settings, project: &Path, access: Access, session: Session) -> Vec<String> {
+pub fn run_args(
+    s: &Settings,
+    project: &Path,
+    access: Access,
+    session: Session,
+    options: &PiOptions,
+) -> Vec<String> {
     let state = project_state(s, project);
     let n = s.names();
     let mut args: Vec<String> = [
@@ -737,6 +802,25 @@ pub fn run_args(s: &Settings, project: &Path, access: Access, session: Session) 
             ""
         }
     ));
+    for (index, plugin) in options
+        .plugins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.enabled)
+    {
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst=/opt/pi-extensions/{index},{}",
+                plugin.path,
+                if s.engine == Engine::Docker {
+                    "readonly"
+                } else {
+                    "ro"
+                }
+            ),
+        ]);
+    }
     args.extend(
         [
             "-w",
@@ -748,16 +832,34 @@ pub fn run_args(s: &Settings, project: &Path, access: Access, session: Session) 
             "--no-mcp",
             "--no-approve",
             "--no-skills",
-            "--tools",
-            if access == Access::ReadOnly {
-                "read,bash"
-            } else {
-                "read,bash,edit,write"
-            },
         ]
         .iter()
         .map(|s| s.to_string()),
     );
+    // Add/remove built-ins without hiding tools registered by explicitly enabled plugins.
+    let mut tools = vec!["+read", "+grep", "+find", "+ls"];
+    tools.push(if options.commands == CommandAccess::Disabled {
+        "-bash"
+    } else {
+        "+bash"
+    });
+    tools.extend(if access == Access::ReadWrite {
+        ["+edit", "+write"]
+    } else {
+        ["-edit", "-write"]
+    });
+    args.extend(["--tools".into(), tools.join(",")]);
+    for (index, _) in options
+        .plugins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.enabled)
+    {
+        args.extend(["-e".into(), format!("/opt/pi-extensions/{index}")]);
+    }
+    if options.skills && project.join(".pi/skills").is_dir() {
+        args.extend(["--skill".into(), "/workspace/.pi/skills".into()]);
+    }
     if let Some(flag) = session.flag() {
         args.push(flag.into());
     }
@@ -770,12 +872,18 @@ pub fn launch(
     data_dir: &Path,
     access: Access,
     session: Session,
+    options: &PiOptions,
     runner: &Runner,
 ) -> Result<PathBuf> {
     if runner.engine != s.engine {
         bail!("Выбран другой контейнерный движок.");
     }
     let project = validate_project(project, s, data_dir)?;
+    let mut options = options.clone();
+    for plugin in options.plugins.iter_mut().filter(|p| p.enabled) {
+        let path = validate_plugin(&plugin.path, s, data_dir)?;
+        plugin.path = path.display().to_string();
+    }
     if !is_configured(s) {
         bail!(
             "Завершите настройку окружения: параметры изменились или настройка ещё не выполнена."
@@ -804,24 +912,243 @@ pub fn launch(
     }
     let agent = project_state(s, &project).join("agent");
     fs::create_dir_all(agent.join("extensions/pi-permission-system"))?;
-    for name in ["models.json", "settings.json"] {
-        let bytes = fs::read(s.env_root().join("config").join(name))?;
-        atomic_write(&agent.join(name), &bytes)?;
-    }
-    let bytes = fs::read(s.env_root().join("config/permissions.json"))?;
-    atomic_write(
+    let bytes = fs::read(s.env_root().join("config/models.json"))?;
+    atomic_write(&agent.join("models.json"), &bytes)?;
+    write_json(&agent.join("settings.json"), &pi_settings(s, &options))?;
+    write_json(
         &agent.join("extensions/pi-permission-system/config.json"),
-        &bytes,
+        &policy(&options, access),
     )?;
-    let args = run_args(s, &project, access, session);
+    let args = run_args(s, &project, access, session, &options);
     (runner.log)(&Cmd::new(args.clone()).preview(s.engine));
     open_terminal(s.engine, &args)?;
     Ok(project)
 }
 
+pub fn validate_plugin(path: &str, settings: &Settings, data_dir: &Path) -> Result<PathBuf> {
+    let path = validate_project(path, settings, data_dir).context("Папка плагина недоступна")?;
+    if !["index.ts", "index.js"]
+        .iter()
+        .any(|name| path.join(name).is_file())
+    {
+        bail!(
+            "В папке плагина нужен index.ts или index.js. Выберите папку расширения с установленными зависимостями."
+        );
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permissions_and_tool_flags_agree_for_every_launch_mode() {
+        let options = PiOptions {
+            rules: vec![
+                PermissionRule {
+                    target: RuleTarget::Write,
+                    pattern: "/workspace/src/*".into(),
+                    action: CommandAccess::Allow,
+                },
+                PermissionRule {
+                    target: RuleTarget::Write,
+                    pattern: "/workspace/src/*".into(),
+                    action: CommandAccess::Ask,
+                },
+                PermissionRule {
+                    target: RuleTarget::Command,
+                    pattern: "*".into(),
+                    action: CommandAccess::Allow,
+                },
+            ],
+            ..Default::default()
+        };
+        let writable = policy(&options, Access::ReadWrite);
+        assert_eq!(writable["permission"]["edit"]["/workspace/src/*"], "ask");
+        assert_eq!(writable["permission"]["bash"]["*"], "allow");
+        assert_eq!(writable["permission"]["bash"]["git push*"], "deny");
+        assert_eq!(
+            writable["permission"]["bash"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next_back()
+                .unwrap(),
+            "git push*"
+        );
+        assert_eq!(
+            policy(&options, Access::ReadOnly)["permission"]["write"],
+            "deny"
+        );
+        for engine in [Engine::Podman, Engine::Docker] {
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                for commands in [
+                    CommandAccess::Disabled,
+                    CommandAccess::Ask,
+                    CommandAccess::Allow,
+                ] {
+                    for confirm_edits in [false, true] {
+                        let options = PiOptions {
+                            commands,
+                            confirm_edits,
+                            ..Default::default()
+                        };
+                        let settings = Settings {
+                            engine,
+                            ..Default::default()
+                        };
+                        let args = run_args(
+                            &settings,
+                            Path::new(r"C:\my project"),
+                            access,
+                            Session::New,
+                            &options,
+                        );
+                        let tools: Vec<_> = args
+                            [args.iter().position(|v| v == "--tools").unwrap() + 1]
+                            .split(',')
+                            .collect();
+                        assert_eq!(
+                            tools.contains(&"+bash"),
+                            commands != CommandAccess::Disabled
+                        );
+                        assert_eq!(
+                            tools.contains(&"-bash"),
+                            commands == CommandAccess::Disabled
+                        );
+                        assert_eq!(tools.contains(&"+write"), access == Access::ReadWrite);
+                        assert_eq!(tools.contains(&"+edit"), access == Access::ReadWrite);
+                        assert_eq!(
+                            tools.contains(&"-edit") && tools.contains(&"-write"),
+                            access == Access::ReadOnly
+                        );
+                        assert!(tools.contains(&"+grep") && tools.contains(&"+find"));
+                        let policy = policy(&options, access);
+                        assert_eq!(
+                            policy["permission"]["write"],
+                            if access == Access::ReadOnly {
+                                "deny"
+                            } else if confirm_edits {
+                                "ask"
+                            } else {
+                                "allow"
+                            }
+                        );
+                        assert_eq!(
+                            policy["permission"]["bash"]["*"],
+                            match commands {
+                                CommandAccess::Disabled => "deny",
+                                CommandAccess::Ask => "ask",
+                                CommandAccess::Allow => "allow",
+                            }
+                        );
+                        assert_eq!(policy["permission"]["bash"]["git push*"], "deny");
+                        assert!(args.iter().any(|v| v == "--no-approve"));
+                        assert!(args.iter().any(|v| v == "--no-mcp"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plugins_are_explicit_readonly_mounts_and_disabled_plugins_are_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".pi/skills")).unwrap();
+        let options = PiOptions {
+            skills: true,
+            plugins: vec![
+                Plugin {
+                    path: r"C:\Bob's $plugins\review".into(),
+                    enabled: true,
+                },
+                Plugin {
+                    path: r"C:\disabled".into(),
+                    enabled: false,
+                },
+            ],
+            ..Default::default()
+        };
+        for engine in [Engine::Podman, Engine::Docker] {
+            let settings = Settings {
+                engine,
+                ..Default::default()
+            };
+            let args = run_args(
+                &settings,
+                dir.path(),
+                Access::ReadOnly,
+                Session::Resume,
+                &options,
+            );
+            assert!(args.iter().any(|v| v.starts_with(
+                "type=bind,src=C:\\Bob's $plugins\\review,dst=/opt/pi-extensions/0,"
+            ) && v.ends_with(if engine == Engine::Docker {
+                "readonly"
+            } else {
+                "ro"
+            })));
+            assert!(args.windows(2).any(|a| a == ["-e", "/opt/pi-extensions/0"]));
+            assert!(
+                !args
+                    .iter()
+                    .any(|v| v.contains("disabled") || v.contains("extensions/1"))
+            );
+            assert!(
+                args.windows(2)
+                    .any(|a| a == ["--skill", "/workspace/.pi/skills"])
+            );
+            assert_eq!(args.last().unwrap(), "--resume");
+        }
+        let args = run_args(
+            &Settings::default(),
+            dir.path(),
+            Access::ReadOnly,
+            Session::New,
+            &PiOptions::default(),
+        );
+        assert!(!args.iter().any(|v| v == "--skill"));
+    }
+
+    #[test]
+    fn plugin_validation_requires_an_entrypoint_and_rejects_infrastructure() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            root: dir.path().join("environment").display().to_string(),
+            ..Default::default()
+        };
+        let data = dir.path().join("launcher");
+        let plugin = dir.path().join("review");
+        fs::create_dir_all(&plugin).unwrap();
+        assert!(validate_plugin(&plugin.display().to_string(), &settings, &data).is_err());
+        fs::write(plugin.join("index.ts"), "export default () => {};").unwrap();
+        assert!(validate_plugin(&plugin.display().to_string(), &settings, &data).is_ok());
+        fs::create_dir_all(&settings.root).unwrap();
+        fs::write(Path::new(&settings.root).join("index.ts"), "").unwrap();
+        assert!(validate_plugin(&settings.root, &settings, &data).is_err());
+    }
+
+    #[test]
+    fn pi_preferences_do_not_invalidate_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            root: dir.path().display().to_string(),
+            model: "local".into(),
+            ..Default::default()
+        };
+        save_config(&settings).unwrap();
+        let options = PiOptions {
+            light_theme: true,
+            auto_compact: false,
+            ..Default::default()
+        };
+        let config = pi_settings(&settings, &options);
+        assert_eq!(config["theme"], "light");
+        assert_eq!(config["compaction"]["enabled"], false);
+        assert_eq!(config["defaultProjectTrust"], "never");
+        assert!(is_configured(&settings));
+    }
 
     #[test]
     fn docker_has_portable_flags_and_only_the_internal_agent_network() {
@@ -830,7 +1157,13 @@ mod tests {
             ..Settings::default()
         };
         let project = Path::new(r"D:\Project with spaces");
-        let ro = run_args(&s, project, Access::ReadOnly, Session::New);
+        let ro = run_args(
+            &s,
+            project,
+            Access::ReadOnly,
+            Session::New,
+            &PiOptions::default(),
+        );
         assert!(ro.iter().any(|a| a.ends_with("dst=/workspace,readonly")));
         assert!(ro.windows(2).any(|a| a == ["--user", "1000:1000"]));
         assert!(ro.iter().any(|a| a == "HTTP_PROXY="));
@@ -840,7 +1173,13 @@ mod tests {
             || a.contains("LLAMA_API_KEY")));
         assert_eq!(ro.iter().filter(|a| *a == "--network").count(), 1);
         assert!(!ro.iter().any(|a| a == &s.names().uplink));
-        let rw = run_args(&s, project, Access::ReadWrite, Session::Continue);
+        let rw = run_args(
+            &s,
+            project,
+            Access::ReadWrite,
+            Session::Continue,
+            &PiOptions::default(),
+        );
         assert!(rw.iter().any(|a| a.ends_with("dst=/workspace")));
         assert_eq!(rw.last().unwrap(), "--continue");
     }
@@ -973,14 +1312,29 @@ mod tests {
     fn readonly_is_enforced_at_mount_and_tool_levels() {
         let s = Settings::default();
         let project = Path::new(r"D:\Bob's $project");
-        let ro = run_args(&s, project, Access::ReadOnly, Session::Continue);
+        let ro = run_args(
+            &s,
+            project,
+            Access::ReadOnly,
+            Session::Continue,
+            &PiOptions::default(),
+        );
         assert!(ro.iter().any(|v| v.ends_with("dst=/workspace,ro")));
-        assert!(ro.iter().any(|v| v == "read,bash"));
+        assert!(
+            ro.iter()
+                .any(|v| v == "+read,+grep,+find,+ls,+bash,-edit,-write")
+        );
         assert_eq!(ro.last().unwrap(), "--continue");
         assert!(!ro.iter().any(|v| v.contains("LLAMA_API_KEY")));
         assert!(ro.iter().any(|v| v == "--network"));
         assert!(!ro.iter().any(|v| v == &s.names().uplink));
-        let rw = run_args(&s, project, Access::ReadWrite, Session::Resume);
+        let rw = run_args(
+            &s,
+            project,
+            Access::ReadWrite,
+            Session::Resume,
+            &PiOptions::default(),
+        );
         assert!(rw.iter().any(|v| v.ends_with("dst=/workspace,rw")));
         assert_eq!(rw.last().unwrap(), "--resume");
     }

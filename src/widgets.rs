@@ -2,11 +2,232 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
-const INK: Color32 = Color32::from_rgb(32, 36, 49);
-const QUIET: Color32 = Color32::from_rgb(116, 122, 137);
-const LINE: Color32 = Color32::from_rgb(222, 225, 233);
-const ACCENT: Color32 = Color32::from_rgb(97, 76, 214);
-const HOVER: Color32 = Color32::from_rgb(249, 248, 255);
+const INK: Color32 = Color32::from_rgb(29, 38, 43);
+const QUIET: Color32 = Color32::from_rgb(101, 114, 121);
+const LINE: Color32 = Color32::from_rgb(224, 230, 230);
+const ACCENT: Color32 = Color32::from_rgb(22, 112, 100);
+const HOVER: Color32 = Color32::from_rgb(240, 248, 244);
+
+#[derive(Clone, Copy)]
+pub enum Icon {
+    Folder,
+    Plus,
+    Settings,
+    Plug,
+    Terminal,
+    History,
+    Back,
+    Help,
+    Close,
+    Puzzle,
+}
+
+pub fn icon(ui: &Ui, center: Pos2, kind: Icon, color: Color32, size: f32) {
+    let stroke = Stroke::new(1.6_f32, color);
+    let point = |x: f32, y: f32| center + Vec2::new(x, y) * (size / 20.0);
+    let line = |points: &[(f32, f32)]| {
+        ui.painter().add(egui::Shape::line(
+            points.iter().map(|(x, y)| point(*x, *y)).collect(),
+            stroke,
+        ));
+    };
+    match kind {
+        Icon::Folder => line(&[
+            (-8., -6.),
+            (-2., -6.),
+            (0., -3.),
+            (8., -3.),
+            (8., 7.),
+            (-8., 7.),
+            (-8., -6.),
+        ]),
+        Icon::Plus => {
+            line(&[(-7., 0.), (7., 0.)]);
+            line(&[(0., -7.), (0., 7.)]);
+        }
+        Icon::Close => {
+            line(&[(-5., -5.), (5., 5.)]);
+            line(&[(5., -5.), (-5., 5.)]);
+        }
+        Icon::Back => {
+            line(&[(-7., 0.), (7., 0.)]);
+            line(&[(-1., -6.), (-7., 0.), (-1., 6.)]);
+        }
+        Icon::Terminal => {
+            line(&[(-8., -7.), (8., -7.), (8., 7.), (-8., 7.), (-8., -7.)]);
+            line(&[(-5., -3.), (-2., 0.), (-5., 3.)]);
+            line(&[(1., 3.), (5., 3.)]);
+        }
+        Icon::History => {
+            ui.painter().circle_stroke(center, size * 0.39, stroke);
+            line(&[(0., -5.), (0., 0.), (4., 2.)]);
+        }
+        Icon::Plug => {
+            line(&[(-5., -8.), (-5., -3.)]);
+            line(&[(5., -8.), (5., -3.)]);
+            line(&[
+                (-7., -3.),
+                (7., -3.),
+                (7., 1.),
+                (3., 5.),
+                (-3., 5.),
+                (-7., 1.),
+                (-7., -3.),
+            ]);
+            line(&[(0., 5.), (0., 9.)]);
+        }
+        Icon::Settings => {
+            ui.painter().circle_stroke(center, size * 0.3, stroke);
+            ui.painter().circle_stroke(center, size * 0.11, stroke);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.;
+                let d = Vec2::angled(a);
+                ui.painter()
+                    .line_segment([center + d * size * 0.30, center + d * size * 0.45], stroke);
+            }
+        }
+        Icon::Help => {
+            ui.painter().circle_stroke(center, size * 0.42, stroke);
+            ui.painter().text(
+                center,
+                Align2::CENTER_CENTER,
+                "?",
+                FontId::proportional(size * 0.8),
+                color,
+            );
+        }
+        Icon::Puzzle => {
+            line(&[
+                (-7., -7.),
+                (-2., -7.),
+                (-2., -9.),
+                (2., -9.),
+                (2., -7.),
+                (7., -7.),
+                (7., -2.),
+                (4., -2.),
+                (4., 2.),
+                (7., 2.),
+                (7., 7.),
+                (-7., 7.),
+                (-7., -7.),
+            ]);
+        }
+    }
+}
+
+pub fn icon_button(ui: &mut Ui, kind: Icon, label: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, 8, HOVER);
+    }
+    icon(ui, rect.center(), kind, INK, 19.0);
+    response
+        .on_hover_text(label)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub fn nav_button(ui: &mut Ui, kind: Icon, label: &str, selected: bool) -> Response {
+    let (rect, response) = surface(ui, 42.0, label);
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            8,
+            if selected {
+                Color32::from_rgb(231, 244, 239)
+            } else {
+                HOVER
+            },
+        );
+    }
+    icon(
+        ui,
+        rect.left_center() + Vec2::new(18.0, 0.0),
+        kind,
+        if selected { ACCENT } else { QUIET },
+        18.0,
+    );
+    clipped_text(
+        ui,
+        label,
+        Rect::from_min_max(
+            rect.min + Vec2::new(38.0, 0.0),
+            rect.max - Vec2::new(10.0, 0.0),
+        ),
+        15.0,
+        INK,
+    );
+    response
+}
+
+pub fn action(ui: &mut Ui, kind: Icon, label: &str, enabled: bool) -> bool {
+    let start = ui.cursor().min;
+    let clicked = button(ui, label, enabled);
+    icon(
+        ui,
+        start + Vec2::new(24.0, 22.0),
+        kind,
+        Color32::WHITE,
+        19.0,
+    );
+    clicked
+}
+
+pub fn icon_segments(ui: &mut Ui, selected: &mut usize, items: &[(Icon, &str)]) {
+    let (rect, group) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 9, Color32::from_rgb(238, 241, 242));
+    let width = (rect.width() - 6.0) / items.len() as f32;
+    for (index, (kind, label)) in items.iter().enumerate() {
+        let item = Rect::from_min_size(
+            rect.min + Vec2::new(3.0 + index as f32 * width, 3.0),
+            Vec2::new(width, 38.0),
+        );
+        let response = ui.interact(item, group.id.with(index), Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                ui.is_enabled(),
+                *selected == index,
+                *label,
+            )
+        });
+        if response.clicked() {
+            *selected = index;
+        }
+        if *selected == index || response.has_focus() {
+            ui.painter().rect(
+                item,
+                7,
+                Color32::WHITE,
+                Stroke::new(1.0_f32, if response.has_focus() { ACCENT } else { LINE }),
+                StrokeKind::Inside,
+            );
+        }
+        let color = if *selected == index { ACCENT } else { QUIET };
+        icon(
+            ui,
+            item.left_center() + Vec2::new(20.0, 0.0),
+            *kind,
+            color,
+            18.0,
+        );
+        clipped_text(
+            ui,
+            label,
+            Rect::from_min_max(
+                item.min + Vec2::new(39.0, 0.0),
+                item.max - Vec2::new(8.0, 0.0),
+            ),
+            14.0,
+            color,
+        );
+    }
+}
 
 fn surface(ui: &mut Ui, height: f32, name: &str) -> (Rect, Response) {
     let (rect, response) =
@@ -29,11 +250,11 @@ pub fn button(ui: &mut Ui, text: &str, enabled: bool) -> bool {
     ui.add_enabled_ui(enabled, |ui| {
         let (rect, response) = surface(ui, 44.0, text);
         let fill = if !ui.is_enabled() {
-            Color32::from_rgb(212, 207, 235)
+            Color32::from_rgb(174, 199, 192)
         } else if response.is_pointer_button_down_on() {
-            Color32::from_rgb(75, 56, 182)
+            Color32::from_rgb(17, 88, 79)
         } else if response.hovered() {
-            Color32::from_rgb(111, 90, 227)
+            Color32::from_rgb(27, 128, 113)
         } else {
             ACCENT
         };
@@ -66,10 +287,6 @@ pub fn secondary(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     secondary_button(ui, text, enabled, false)
 }
 
-pub fn secondary_full(ui: &mut Ui, text: &str, enabled: bool) -> Response {
-    secondary_button(ui, text, enabled, true)
-}
-
 fn secondary_button(ui: &mut Ui, text: &str, enabled: bool, full: bool) -> Response {
     ui.add_enabled_ui(enabled, |ui| {
         let font = FontId::proportional(15.0);
@@ -91,7 +308,7 @@ fn secondary_button(ui: &mut Ui, text: &str, enabled: bool, full: bool) -> Respo
         let fill = if !active {
             Color32::from_rgb(245, 246, 249)
         } else if response.is_pointer_button_down_on() {
-            Color32::from_rgb(234, 230, 252)
+            Color32::from_rgb(225, 240, 234)
         } else if response.hovered() {
             HOVER
         } else {
@@ -126,6 +343,14 @@ fn secondary_button(ui: &mut Ui, text: &str, enabled: bool, full: bool) -> Respo
 }
 
 pub fn select(ui: &mut Ui, text: &str) -> Response {
+    select_with_icon(ui, text, None)
+}
+
+pub fn select_icon(ui: &mut Ui, text: &str, kind: Icon) -> Response {
+    select_with_icon(ui, text, Some(kind))
+}
+
+fn select_with_icon(ui: &mut Ui, text: &str, kind: Option<Icon>) -> Response {
     let (rect, response) = surface(ui, 44.0, text);
     ui.painter().rect(
         rect,
@@ -138,59 +363,32 @@ pub fn select(ui: &mut Ui, text: &str) -> Response {
         Stroke::new(1.0_f32, LINE),
         StrokeKind::Inside,
     );
-    ui.painter().text(
-        rect.left_center() + Vec2::new(14.0, 0.0),
-        Align2::LEFT_CENTER,
+    clipped_text(
+        ui,
         text,
-        FontId::proportional(15.0),
+        Rect::from_min_max(
+            rect.min + Vec2::new(if kind.is_some() { 42.0 } else { 14.0 }, 0.0),
+            rect.max - Vec2::new(34.0, 0.0),
+        ),
+        15.0,
         INK,
     );
+    if let Some(kind) = kind {
+        icon(
+            ui,
+            rect.left_center() + Vec2::new(21.0, 0.0),
+            kind,
+            QUIET,
+            18.0,
+        );
+    }
     chevron(ui, rect);
     response
 }
 
-pub fn folder(ui: &mut Ui, path: &str) -> bool {
-    let title = if path.is_empty() {
-        "Выбрать папку"
-    } else {
-        path
-    };
-    let (rect, response) = surface(ui, 48.0, title);
-    ui.painter().rect(
-        rect,
-        9,
-        if response.hovered() {
-            HOVER
-        } else {
-            Color32::WHITE
-        },
-        Stroke::new(1.0_f32, if response.hovered() { ACCENT } else { LINE }),
-        StrokeKind::Inside,
-    );
-    let p = rect.left_center() + Vec2::new(14.0, -7.0);
-    let points = [
-        (0.0, 0.0),
-        (6.0, 0.0),
-        (8.0, 3.0),
-        (18.0, 3.0),
-        (18.0, 14.0),
-        (0.0, 14.0),
-        (0.0, 0.0),
-    ]
-    .into_iter()
-    .map(|(x, y)| p + Vec2::new(x, y))
-    .collect();
-    ui.painter()
-        .add(egui::Shape::line(points, Stroke::new(1.4_f32, QUIET)));
-    let text_rect = Rect::from_min_max(
-        rect.min + Vec2::new(44.0, 0.0),
-        rect.max - Vec2::new(88.0, 0.0),
-    );
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        title.into(),
-        FontId::proportional(15.0),
-        if path.is_empty() { QUIET } else { INK },
-    );
+fn clipped_text(ui: &Ui, title: &str, text_rect: Rect, size: f32, color: Color32) {
+    let mut job =
+        egui::text::LayoutJob::simple_singleline(title.into(), FontId::proportional(size), color);
     job.wrap.max_width = text_rect.width();
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -198,20 +396,89 @@ pub fn folder(ui: &mut Ui, path: &str) -> bool {
     ui.painter().with_clip_rect(text_rect).galley(
         text_rect.left_center() - Vec2::new(0.0, galley.size().y / 2.0),
         galley,
-        INK,
+        color,
     );
+}
+
+pub fn project_row(
+    ui: &mut Ui,
+    title: &str,
+    path: &str,
+    selected: bool,
+    pinned: bool,
+) -> (Response, bool) {
+    let (rect, response) = surface(ui, 42.0, title);
+    ui.painter().rect_filled(
+        rect,
+        8,
+        if selected {
+            Color32::from_rgb(231, 244, 239)
+        } else if response.hovered() {
+            HOVER
+        } else {
+            Color32::TRANSPARENT
+        },
+    );
+    let inner = Rect::from_min_max(
+        rect.min + Vec2::new(36.0, 9.0),
+        rect.max - Vec2::new(8.0, 9.0),
+    );
+    icon(
+        ui,
+        rect.left_center() + Vec2::new(17.0, 0.0),
+        Icon::Folder,
+        if selected { ACCENT } else { QUIET },
+        17.0,
+    );
+    clipped_text(
+        ui,
+        title,
+        Rect::from_min_size(inner.min, Vec2::new(inner.width() - 24.0, 24.0)),
+        15.0,
+        if selected { ACCENT } else { INK },
+    );
+    let pin_rect = Rect::from_min_size(rect.right_top() + Vec2::new(-32.0, 4.0), Vec2::splat(28.0));
+    let pin = ui.interact(pin_rect, response.id.with("pin"), Sense::click());
+    pin.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            if pinned {
+                "Открепить проект"
+            } else {
+                "Закрепить проект"
+            },
+        )
+    });
     ui.painter().text(
-        rect.right_center() - Vec2::new(14.0, 0.0),
-        Align2::RIGHT_CENTER,
-        "Обзор…",
-        FontId::proportional(15.0),
-        ACCENT,
+        pin_rect.center(),
+        Align2::CENTER_CENTER,
+        if pinned { "★" } else { "☆" },
+        FontId::proportional(18.0),
+        if pinned || pin.hovered() {
+            ACCENT
+        } else {
+            QUIET
+        },
     );
-    response.on_hover_text(title).clicked()
+    let clicked = pin
+        .on_hover_text(if pinned {
+            "Открепить"
+        } else {
+            "Закрепить"
+        })
+        .clicked();
+    (
+        response.on_hover_text(format!(
+            "{path}\nДвойной щелчок — открыть pi\nПравая кнопка — закрепить или убрать"
+        )),
+        clicked,
+    )
 }
 
 pub fn segmented(ui: &mut Ui, selected: &mut usize, labels: &[&str]) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
+    let (rect, group) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
     ui.painter()
         .rect_filled(rect, 9, Color32::from_rgb(240, 241, 245));
     let width = (rect.width() - 6.0) / labels.len() as f32;
@@ -220,7 +487,7 @@ pub fn segmented(ui: &mut Ui, selected: &mut usize, labels: &[&str]) {
             rect.min + Vec2::new(3.0 + index as f32 * width, 3.0),
             Vec2::new(width, 38.0),
         );
-        let response = ui.interact(item, ui.id().with(("segment", index)), Sense::click());
+        let response = ui.interact(item, group.id.with(index), Sense::click());
         response.widget_info(|| {
             egui::WidgetInfo::selected(
                 egui::WidgetType::SelectableLabel,
@@ -329,6 +596,29 @@ mod tests {
             },
         );
         assert!(clicked);
+    }
+
+    #[test]
+    fn multiple_segment_groups_do_not_share_clicks_or_selection() {
+        let ctx = egui::Context::default();
+        let mut first = 0;
+        let mut second = 0;
+        let bottom = Pos2::new(450.0, 80.0);
+        for events in [vec![], pointer(bottom, true), pointer(bottom, false)] {
+            frame(&ctx, events, |ui| {
+                segmented(ui, &mut first, &["Ask", "Allow"]);
+                segmented(ui, &mut second, &["New", "Continue"]);
+            });
+        }
+        assert_eq!((first, second), (0, 1));
+        let top = Pos2::new(450.0, 25.0);
+        for events in [pointer(top, true), pointer(top, false)] {
+            frame(&ctx, events, |ui| {
+                segmented(ui, &mut first, &["Ask", "Allow"]);
+                segmented(ui, &mut second, &["New", "Continue"]);
+            });
+        }
+        assert_eq!((first, second), (1, 1));
     }
 
     #[test]
