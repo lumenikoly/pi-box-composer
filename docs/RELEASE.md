@@ -7,14 +7,14 @@ workflow создаёт тег v<version> на исходном коммите �
 ## Подготовка
 
 1. Обновите версию в Cargo.toml, записи пакета pi-box-composer в Cargo.lock
-   и заголовке CHANGELOG.md. Текущая версия — 0.0.5.
+   и заголовке CHANGELOG.md. Текущая версия — 0.0.6.
 2. Закоммитьте исходники в main и отправьте ветку на GitHub.
 3. Откройте **Actions → Release executable → Run workflow**, выберите main
-   и укажите 0.0.5 без префикса v.
+   и укажите 0.0.6 без префикса v.
 
 С GitHub CLI тот же запуск выполняется так:
 
-    gh workflow run release.yml --ref main -f version=0.0.5
+    gh workflow run release.yml --ref main -f version=0.0.6
 
 Workflow проверяет ветку, имя и версии пакета, release notes и отсутствие
 существующего тега. Затем Windows runner собирает приложение командой:
@@ -28,7 +28,7 @@ Workflow проверяет ветку, имя и версии пакета, rel
 
 ## Файлы релиза
 
-    pi-box-composer_0.0.5_windows_x64.exe
+    pi-box-composer_0.0.6_windows_x64.exe
     SHA256SUMS
 
 EXE не подписан. В релиз не входят Rust, Podman, Docker Desktop, контейнерные

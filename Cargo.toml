@@ -1,6 +1,6 @@
 [package]
 name = "pi-box-composer"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 rust-version = "1.88"
 description = "A Windows launcher for Pi environments in Podman or Docker Desktop"
